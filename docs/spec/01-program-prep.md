@@ -254,7 +254,9 @@ offset off `g` — still anchored. A golang target with no pinned register
 go1.22 hello-world: functions declaring a phantom `// r14` local 267 → 23,
 functions reading named `g->` fields 7 → 297, the preemption-request store
 rendering `g->stackguard0 = 0xfffffffffffffade` exactly as the runtime source
-spells it.
+spells it. When a runtime function saves `g` across calls, the same typed
+store can render through a local initialized from `g`; the register naming
+does not require every goroutine field access to use the global directly.
 
 The loader's symbol
 stream — defined FUNC symbols plus the resolved import stubs of §1.3 — is

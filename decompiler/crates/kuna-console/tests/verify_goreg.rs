@@ -3,7 +3,7 @@
 //!
 //! The proof, on a REAL stripped Go build under the golang cspec (`goabi`
 //! auto): a runtime function that manipulates goroutine state renders its
-//! accesses through the named, typed `g` global (`g->stackguard0`), and with
+//! accesses through the named, typed `g` global or a saved copy, and with
 //! `KUNA_GOREG=off` the same function falls back to the phantom-register
 //! reading (no `g->` anywhere). `runtime.unlock2` is the witness: it is
 //! present in every modern Go binary, named by the pclntab on a stripped
@@ -133,17 +133,19 @@ fn goroutine_state_renders_through_the_named_g_global() {
     }
     let bin = out_bin.to_str().expect("utf8 path");
 
-    // Default: goroutine state reads through the named, typed global. The
-    // stackguard0 store is at the liblink-stated offset 0x10, stable across
-    // Go releases, so the assertion holds wherever the runtime drifts later.
     let on = decompile_unlock2(bin);
     assert!(
         on.contains("g->"),
         "goreg on must render g-relative accesses through the named global; transcript:\n{on}"
     );
+    let store = regex::Regex::new(r"(?m)^\s*(\w+)->stackguard0 = 0xfffffffffffffade;$").unwrap();
+    let store = store.captures(&on).unwrap_or_else(|| {
+        panic!("the preemption-request store renders at its liblink offset; transcript:\n{on}")
+    });
+    let base = &store[1];
     assert!(
-        on.contains("g->stackguard0"),
-        "the preemption-request store renders at its liblink offset; transcript:\n{on}"
+        base == "g" || on.lines().any(|line| line.trim() == format!("{base} = g;")),
+        "the preemption-request store must use g or a saved copy of g; transcript:\n{on}"
     );
 
     // Off: the raw reading returns — no named global anywhere in the body.
