@@ -20,7 +20,7 @@ use kuna_num::opcodes::OpCode;
 use kuna_base::types::int4;
 
 use crate::block::BlockKind;
-use crate::context::{BlockId, OpId};
+use crate::context::{BlockId, OpId, VarnodeId};
 use crate::funcdata::Funcdata;
 
 /// A matched entry-guard loop: a conditional at the function entry whose cold
@@ -294,4 +294,250 @@ fn block_has_other_call(data: &Funcdata, bl: BlockId, keep: OpId) -> bool {
         }
     }
     false
+}
+
+/// A matched barrier arm whose values escape only through join phis: the
+/// post-SSA form of the guarded cold call ([`GuardedColdCall`] is the pre-SSA
+/// one-hop form). The arm may be shared by several guards and its call result
+/// may feed MULTIEQUALs at the join — exactly what the one-hop matcher
+/// refuses — so this match carries EVERY guard edge and is only sound to act
+/// on once SSA has made every read explicit.
+pub struct GuardedColdCallPhi {
+    /// Every `(guard block, out-edge index)` entering the cold arm. Each
+    /// guard ends in a CBRANCH whose condition reads a global flag.
+    pub guard_edges: Vec<(BlockId, int4)>,
+    /// The cold arm `A`: one block, one runtime CALL, bookkeeping only.
+    pub cold_block: BlockId,
+    /// The runtime CALL inside `A` that identified the shape.
+    pub call_op: OpId,
+}
+
+/// Opcodes a GC-bookkeeping arm may contain besides its one CALL: the buffer
+/// stores, the loads of old values, address arithmetic, value plumbing, the
+/// call's own INDIRECT effects, shared-arm phis, and the closing branch.
+/// Anything else is program logic and refuses the match.
+fn wbarm_op_allowed(code: OpCode) -> bool {
+    matches!(
+        code,
+        OpCode::CPUI_COPY
+            | OpCode::CPUI_LOAD
+            | OpCode::CPUI_STORE
+            | OpCode::CPUI_INT_ADD
+            | OpCode::CPUI_INT_SUB
+            | OpCode::CPUI_INT_MULT
+            | OpCode::CPUI_INT_LEFT
+            | OpCode::CPUI_INT_RIGHT
+            | OpCode::CPUI_INT_AND
+            | OpCode::CPUI_INT_OR
+            | OpCode::CPUI_INT_XOR
+            | OpCode::CPUI_INT_ZEXT
+            | OpCode::CPUI_INT_SEXT
+            | OpCode::CPUI_SUBPIECE
+            | OpCode::CPUI_PIECE
+            | OpCode::CPUI_PTRADD
+            | OpCode::CPUI_PTRSUB
+            | OpCode::CPUI_CAST
+            | OpCode::CPUI_MULTIEQUAL
+            | OpCode::CPUI_INDIRECT
+            | OpCode::CPUI_BRANCH
+    )
+}
+
+/// Walk `vn`'s definition chain toward a pointer root: follows the base
+/// operand of address arithmetic and value plumbing, bounded. `true` iff the
+/// root is `root_op`'s output — the wb buffer pointer the arm's stores must
+/// write through.
+fn vn_roots_at_call(data: &Funcdata, mut vn: VarnodeId, root_op: OpId, arm: BlockId) -> bool {
+    for _ in 0..16 {
+        let Some(v) = data.vbank().get(vn) else { return false };
+        let Some(def) = v.get_def() else { return false };
+        let Some(op) = data.obank().get(def) else { return false };
+        if def == root_op {
+            return true;
+        }
+        // The buffer register usually comes back as the call's INDIRECT
+        // effect rather than its formal output: accept an INDIRECT in the arm
+        // whose affecting op (the iop input) IS the matched call.
+        if op.code() == OpCode::CPUI_INDIRECT && op.get_parent() == Some(arm) {
+            if let Some(iop_vn) = op.get_in(1) {
+                if let Some(iv) = data.vbank().get(iop_vn) {
+                    let aff = crate::funcdata_varnode::op_iop_decode(iv.get_addr().get_offset());
+                    if aff == root_op {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+        // Stay inside the arm: a base defined elsewhere is not the buffer.
+        if op.get_parent() != Some(arm) {
+            return false;
+        }
+        vn = match op.code() {
+            OpCode::CPUI_COPY
+            | OpCode::CPUI_CAST
+            | OpCode::CPUI_INT_ADD
+            | OpCode::CPUI_INT_SUB
+            | OpCode::CPUI_PTRADD
+            | OpCode::CPUI_PTRSUB => match op.get_in(0) {
+                Some(base) => base,
+                None => return false,
+            },
+            _ => return false,
+        };
+    }
+    false
+}
+
+/// `true` if the CBRANCH condition `cond` derives (bounded) from a global
+/// flag: a varnode whose storage is addressable memory (a direct global
+/// read), or a LOAD through a constant pointer. A stack or register
+/// condition is a program decision, never the write-barrier flag.
+fn cond_reads_global_flag(data: &Funcdata, cond: VarnodeId) -> bool {
+    let mut stack = vec![(cond, 0usize)];
+    while let Some((vn, depth)) = stack.pop() {
+        if depth > 6 {
+            continue;
+        }
+        let Some(v) = data.vbank().get(vn) else { continue };
+        if v.get_space().get_name() == "ram" {
+            return true;
+        }
+        let Some(def) = v.get_def() else { continue };
+        let Some(op) = data.obank().get(def) else { continue };
+        match op.code() {
+            OpCode::CPUI_LOAD => {
+                if let Some(ptr) = op.get_in(1) {
+                    if data.vbank().get(ptr).map(|p| p.is_constant()).unwrap_or(false) {
+                        return true;
+                    }
+                    stack.push((ptr, depth + 1));
+                }
+            }
+            OpCode::CPUI_COPY
+            | OpCode::CPUI_CAST
+            | OpCode::CPUI_BOOL_NEGATE
+            | OpCode::CPUI_INT_EQUAL
+            | OpCode::CPUI_INT_NOTEQUAL
+            | OpCode::CPUI_INT_LESS
+            | OpCode::CPUI_INT_SLESS
+            | OpCode::CPUI_INT_AND
+            | OpCode::CPUI_SUBPIECE
+            | OpCode::CPUI_INT_ZEXT => {
+                for i in 0..op.num_input() {
+                    if let Some(inp) = op.get_in(i) {
+                        stack.push((inp, depth + 1));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Match one post-SSA barrier arm whose cold-arm callee satisfies `callee`.
+///
+/// The invariants, each one a refusal:
+/// - the CALL's block `A` is Basic with exactly ONE out-edge (the join) and
+///   no other CALL of any kind;
+/// - EVERY predecessor of `A` is a Basic block ending in a CBRANCH (so every
+///   way in is a guard), and every guard's condition derives from a global
+///   flag ([`cond_reads_global_flag`]);
+/// - every op in `A` is on the bookkeeping allowlist
+///   ([`wbarm_op_allowed`]), and every STORE in `A` writes through a pointer
+///   rooted at the matched call's output ([`vn_roots_at_call`]) — a store to
+///   program memory refuses the whole match;
+/// - every value DEFINED in `A` (call output, INDIRECT effects, arm phis,
+///   arithmetic) is read only inside `A` or by a MULTIEQUAL in `A`'s join —
+///   so severing the arm can strand no read anywhere else.
+///
+/// Acting on a match = cutting the guard edges (the caller cuts one per
+/// apply and re-matches): `branch_remove_internal` drops the corresponding
+/// MULTIEQUAL inputs, and once the last edge goes the unreachable sweep
+/// removes `A`, its join phi inputs with it.
+pub fn match_guarded_cold_call_phi(
+    data: &Funcdata,
+    callee: &dyn Fn(&str) -> bool,
+) -> Option<GuardedColdCallPhi> {
+    'calls: for i in 0..data.num_calls() {
+        let fc = data.get_call_specs(i);
+        if !callee(fc.get_name()) {
+            continue;
+        }
+        let call_op = fc.get_op();
+        let Some(op) = data.obank().get(call_op) else { continue };
+        let Some(cold) = op.get_parent() else { continue };
+        let blocks = data.bblocks_ref();
+        if !matches!(blocks.block(cold).kind(), BlockKind::Basic(_)) {
+            continue;
+        }
+        if blocks.block(cold).size_out() != 1 || blocks.block(cold).size_in() < 1 {
+            continue;
+        }
+        let join = blocks.block(cold).get_out(0);
+        if join == cold {
+            continue;
+        }
+        if block_has_other_call(data, cold, call_op) {
+            continue;
+        }
+        // Every way in is a global-flag guard.
+        let n_in = blocks.block(cold).size_in();
+        let mut guard_edges: Vec<(BlockId, int4)> = Vec::new();
+        for j in 0..n_in {
+            let guard = blocks.block(cold).get_in(j);
+            if guard == cold || guard == join {
+                continue 'calls;
+            }
+            if !matches!(blocks.block(guard).kind(), BlockKind::Basic(_)) {
+                continue 'calls;
+            }
+            if blocks.block(guard).size_out() != 2 {
+                continue 'calls;
+            }
+            let Some(tail) = data.bb_op_tail(guard) else { continue 'calls };
+            let Some(tail_op) = data.obank().get(tail) else { continue 'calls };
+            if tail_op.code() != OpCode::CPUI_CBRANCH {
+                continue 'calls;
+            }
+            let Some(cond) = tail_op.get_in(1) else { continue 'calls };
+            if !cond_reads_global_flag(data, cond) {
+                continue 'calls;
+            }
+            let Some(edge) = (0..2).find(|&e| blocks.block(guard).get_out(e) == cold) else {
+                continue 'calls;
+            };
+            guard_edges.push((guard, edge));
+        }
+        if guard_edges.is_empty() {
+            continue;
+        }
+        // Bookkeeping ops only, buffer-rooted stores only, no escaping value.
+        for aop in data.bb_ops(cold) {
+            let Some(o) = data.obank().get(aop) else { continue 'calls };
+            if aop != call_op && !wbarm_op_allowed(o.code()) {
+                continue 'calls;
+            }
+            if o.code() == OpCode::CPUI_STORE {
+                let Some(ptr) = o.get_in(1) else { continue 'calls };
+                if !vn_roots_at_call(data, ptr, call_op, cold) {
+                    continue 'calls;
+                }
+            }
+            if let Some(out) = o.get_out() {
+                let Some(v) = data.vbank().get(out) else { continue 'calls };
+                for reader in v.descend_iter() {
+                    let Some(r) = data.obank().get(reader) else { continue 'calls };
+                    match r.get_parent() {
+                        Some(p) if p == cold => {}
+                        Some(p) if p == join && r.code() == OpCode::CPUI_MULTIEQUAL => {}
+                        _ => continue 'calls,
+                    }
+                }
+            }
+        }
+        return Some(GuardedColdCallPhi { guard_edges, cold_block: cold, call_op });
+    }
+    None
 }
