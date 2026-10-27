@@ -432,10 +432,10 @@ fn streaming_readme_renders_pending_facts_then_the_streamed_layout() {
     );
 }
 
-/// A running address-layout export inventories the non-stream artifacts and
+/// A running `--progress` export inventories the non-stream artifacts and
 /// says they arrive at the end, behind a feed whose offsets are not set yet.
 #[test]
-fn streaming_readme_in_the_address_layout_describes_the_final_artifacts() {
+fn progress_readme_describes_the_final_artifacts() {
     let prog = loaded_fauxware();
     let facts = ReadmeFacts::snapshot(&fauxware(), "/tmp/fauxware", "fauxware", &prog);
     let running = render_readme_streaming(
@@ -448,10 +448,10 @@ fn streaming_readme_in_the_address_layout_describes_the_final_artifacts() {
             artifacts: true,
             ..StreamProgress::default()
         },
-        ReadmeLayout::StreamedAddress,
+        ReadmeLayout::Progress,
     );
     assert!(running.contains("**This export is still streaming**"), "{running}");
-    assert!(running.contains("--stream-layout address"), "{running}");
+    assert!(running.contains("decompile-project --progress"), "{running}");
     assert!(running.contains("address-ordered"), "{running}");
     assert!(!running.contains("DECOMPILE order"), "{running}");
     assert!(!running.contains("; --- variables ---"), "{running}");

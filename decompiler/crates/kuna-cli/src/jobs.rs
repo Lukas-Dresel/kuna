@@ -219,7 +219,7 @@ pub(crate) struct PoolConfig<'a> {
     /// replays instead of searching the image again.
     pub(crate) arm_frames: Option<String>,
     /// Told about the first decompile of every target as its chunk lands — the
-    /// `--stream --stream-layout address` progress feed.
+    /// `decompile-project --progress` feed.
     pub(crate) watch: Option<&'a dyn PoolWatch>,
 }
 

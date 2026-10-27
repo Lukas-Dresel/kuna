@@ -2056,10 +2056,10 @@ the only trace. Progress writes are the exception in both directions: the status
 file and the running README report on the export rather than being it, so a
 failed rewrite of either warns and is retried on the next tick.
 
-(kuna) **The address layout.** `--stream-layout address`
-(`decompiler/crates/kuna-cli/src/project_stream/address.rs`) keeps the half of
+(kuna) **Progress without streaming.** `decompile-project --progress`
+(`decompiler/crates/kuna-cli/src/project_stream/progress.rs`) keeps the half of
 the streamed contract a pipeline polls — `.streaming` and a per-function feed —
-and gives back the half the decompile order cost, reproducibility. It does not
+and drops the incremental artifacts, which is what cost reproducibility. It does not
 schedule or write anything itself: it runs the non-stream export
 (`decompiler/crates/kuna-cli/src/decompile_project.rs (decompile_project,
 ExportWatch)`) with an observer attached, so the static plan, the
@@ -2079,7 +2079,7 @@ the final results, the one artifact this layout adds. One clock thread publishes
 `.streaming` throughout and the running README until every function is in; a
 lock shared with the move to `finalizing` keeps a late running README from
 landing on top of the export's own. The previous export's `.c`, `.h` and `.asm`
-are removed where the default layout would truncate them, so the folder never
+are removed where `--stream` would truncate them, so the folder never
 pairs a new feed with an old body.
 
 (kuna) **Declared function boundaries.** Every function boundary the engine knows

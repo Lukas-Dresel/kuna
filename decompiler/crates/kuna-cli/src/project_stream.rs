@@ -28,11 +28,10 @@
 //! `kuna_console::project_stream` / `kuna_console::project`; this module is the
 //! orchestration — the scheduler, the writer and the timeline.
 //!
-//! `--stream-layout address` keeps the status file, the README and the feed but
-//! none of the above order: [`address`] runs the non-stream export and reports
-//! on it.
+//! `--progress` keeps the status file, the README and the feed but none of the
+//! above order: [`progress`] runs the non-stream export and reports on it.
 
-mod address;
+mod progress;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::File;
@@ -99,32 +98,23 @@ const CALLWIDE_PENDING_CODE_BYTES: usize = 64 * 1024 * 1024;
 /// own error is what the run reports whenever it has one.
 const WRITER_STOPPED: &str = "the streaming writer stopped early";
 
-/// `--stream-layout`: what the streamed folder looks like once it is done.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum StreamLayout {
-    /// The `.c` in decompile order, readable while it fills.
-    #[default]
-    Decompile,
-    /// The non-stream export's artifacts, written at the end, behind a live
-    /// feed: reproducible under `--jobs N` wherever the non-stream export is.
-    Address,
+/// Which of the two exports that report while they run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamMode {
+    /// `--stream`: the artifacts are written as the run goes, the `.c` in
+    /// decompile order and readable while it fills.
+    Stream,
+    /// `--progress`: the non-stream export's artifacts, written at the end,
+    /// behind a live feed — reproducible under `--jobs N` wherever the
+    /// non-stream export is.
+    Progress,
 }
 
-impl StreamLayout {
-    pub(crate) fn parse(value: &str) -> Result<Self, String> {
-        match value {
-            "decompile" => Ok(Self::Decompile),
-            "address" => Ok(Self::Address),
-            _ => Err(format!(
-                "invalid --stream-layout value {value:?} (expected `decompile` or `address`)"
-            )),
-        }
-    }
-
+impl StreamMode {
     fn readme(self) -> ReadmeLayout {
         match self {
-            Self::Decompile => ReadmeLayout::Streamed,
-            Self::Address => ReadmeLayout::StreamedAddress,
+            Self::Stream => ReadmeLayout::Streamed,
+            Self::Progress => ReadmeLayout::Progress,
         }
     }
 }
@@ -822,7 +812,7 @@ fn index_line(seq: usize, r: &FuncResult, span: Option<(u64, usize)>) -> String 
 pub(crate) fn run(
     args: &Args,
     output: Option<&str>,
-    stream_layout: StreamLayout,
+    mode: StreamMode,
 ) -> Result<crate::decompile_project::ProjectCompletion, String> {
     let layout = Layout::resolve(args, output)?;
     refuse_a_live_export(&layout.out_dir)?;
@@ -834,7 +824,7 @@ pub(crate) fn run(
         .map_err(|e| format!("cannot create {}: {e}", layout.out_dir.display()))?;
     let run = StreamRun::new(
         layout.out_dir.clone(),
-        stream_layout.readme(),
+        mode.readme(),
         ReadmeFacts::pending(&layout.binary_path, &layout.path_label, &layout.file_name),
         args.jobs.max(1),
     );
@@ -842,9 +832,9 @@ pub(crate) fn run(
     // The two t=0 writes are fatal: they are the proof the folder can be written
     // at all, and there is no next tick to retry them on yet.
     let opened = run.publish_status().and_then(|()| run.publish_readme());
-    let exported = opened.and_then(|()| match stream_layout {
-        StreamLayout::Decompile => export(args, &layout, &run),
-        StreamLayout::Address => address::export(args, output, &layout, &run),
+    let exported = opened.and_then(|()| match mode {
+        StreamMode::Stream => export(args, &layout, &run),
+        StreamMode::Progress => progress::export(args, output, &layout, &run),
     });
     match exported {
         Ok(summary) => Ok(summary),

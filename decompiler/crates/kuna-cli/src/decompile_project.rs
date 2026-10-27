@@ -3,7 +3,7 @@
 //! ```text
 //!   kuna decompile-project <binary> [-o|--output DIR] [--functions a,b,..]
 //!                          [--addr 0xVMA].. [--max-fn-seconds N]
-//!                          [--stream [--stream-layout decompile|address]]
+//!                          [--stream | --progress]
 //!                          [--mode auto|reliable|aggressive|fast] [--option N V]..
 //!                          [--jobs N|auto] [--jobs-chunk N] [--jobs-full-load]
 //!                          [--isa auto|arm|thumb] [--slice ARCH] [--target T]
@@ -35,9 +35,9 @@
 //! before the run finishes, entry-point-first, with an `index.jsonl` per-function
 //! feed and a `.streaming` status file — at the cost of a decompile-ordered
 //! `.c` and an `.asm` whose variable comments move to their own section
-//! ([`crate::project_stream`]).  `--stream-layout address` keeps the feed and the
-//! status file but runs this module's export unchanged, so the artifacts are
-//! the non-stream ones and as reproducible under `--jobs N`.
+//! ([`crate::project_stream`]).  `--progress` keeps the feed and the status file
+//! but runs this module's export unchanged, so the artifacts are the non-stream
+//! ones and as reproducible under `--jobs N`.
 //!
 //! Individual failures remain records and exit 0 while at least one body was
 //! produced. A non-empty selection that produced zero bodies exits nonzero only
@@ -65,7 +65,7 @@ use crate::decompile_all::{
     DriverDefaults,
 };
 use crate::jobs::PoolWatch;
-use crate::project_stream::StreamLayout;
+use crate::project_stream::StreamMode;
 
 /// `kuna decompile-project` entry point.
 pub fn run(argv: &[String]) -> i32 {
@@ -73,29 +73,13 @@ pub fn run(argv: &[String]) -> i32 {
     // decompile-all-only flags, and hand the remainder to the shared parser.
     let mut output: Option<String> = None;
     let mut stream = false;
-    let mut layout: Option<StreamLayout> = None;
+    let mut progress = false;
     let mut rest: Vec<String> = Vec::new();
     let mut i = 0;
     while i < argv.len() {
         match argv[i].as_str() {
             "--stream" => stream = true,
-            "--stream-layout" => {
-                let parsed = argv.get(i + 1).map(|v| StreamLayout::parse(v));
-                match parsed {
-                    Some(Ok(value)) => layout = Some(value),
-                    Some(Err(e)) => {
-                        eprintln!("error: {e}");
-                        usage();
-                        return 2;
-                    }
-                    None => {
-                        eprintln!("error: --stream-layout requires a value");
-                        usage();
-                        return 2;
-                    }
-                }
-                i += 1;
-            }
+            "--progress" => progress = true,
             "-o" | "--output" => {
                 if i + 1 >= argv.len() {
                     eprintln!("error: {} requires a value", argv[i]);
@@ -126,12 +110,14 @@ pub fn run(argv: &[String]) -> i32 {
             return 2;
         }
     };
-    if layout.is_some() && !stream {
-        eprintln!("error: --stream-layout only applies to --stream");
-        usage();
-        return 2;
-    }
-    let layout = layout.unwrap_or_default();
+    // `--stream` already reports progress, so it wins when both are given.
+    let mode = if stream {
+        Some(StreamMode::Stream)
+    } else if progress {
+        Some(StreamMode::Progress)
+    } else {
+        None
+    };
     // An unqualified `--assert` directive binds to "the function under
     // decompile", which a whole-binary streamed run would apply to every one of
     // them in turn.
@@ -143,13 +129,14 @@ pub fn run(argv: &[String]) -> i32 {
         );
         return 2;
     }
-    let run = if stream {
-        if layout == StreamLayout::Decompile {
-            crate::decompile_all::warn_protoorder_inert(&args.options, "decompile-project --stream");
+    let run = match mode {
+        Some(mode) => {
+            if mode == StreamMode::Stream {
+                crate::decompile_all::warn_protoorder_inert(&args.options, "decompile-project --stream");
+            }
+            crate::project_stream::run(&args, output.as_deref(), mode)
         }
-        crate::project_stream::run(&args, output.as_deref(), layout)
-    } else {
-        decompile_project(&args, output.as_deref(), None)
+        None => decompile_project(&args, output.as_deref(), None),
     };
     match run {
         Ok(completion) => emit_completion(completion),
@@ -182,7 +169,7 @@ fn usage() {
          \x20                   [--addr 0xVMA].. [--max-fn-seconds N] [--max-fn-memory MiB] \\\n\
          \x20                   [--mode auto|reliable|aggressive|fast] \\\n\
          \x20                   [--jobs N|auto] [--jobs-chunk N] [--jobs-full-load] \\\n\
-         \x20                   [--stream [--stream-layout decompile|address]] \\\n\
+         \x20                   [--stream | --progress] \\\n\
          \x20                   [--define-function S[-E][=N]|@FILE].. \\\n\
          \x20                   [--option N V].. [--isa auto|arm|thumb] [--slice ARCH] [--target T] [--sleighpath D]\n\
          \x20                   [--raw-image --target T --base VMA (--entry|--addr VMA)..]\n\
@@ -208,16 +195,16 @@ fn usage() {
          .h included: a worker cannot see another worker's callees, so the pool\n\
          does not type call arguments callee-first the way a serial export does,\n\
          nor declare a global or table an array (option elemptr)\n\
-         (under --stream's decompile layout, workers run with structsynth off).\n\
+         (with --stream, workers run with structsynth off).\n\
          Progress goes to\n\
          stderr, and peak memory is roughly N times one worker's RSS.\n\
          --stream writes the folder as the run goes instead of at the end: the entry\n\
          point and what it calls are written first, index.jsonl announces each\n\
          finished function and .streaming reports progress until the export\n\
          completes. The .c is then in decompile order. Not available with --assert.\n\
-         --stream-layout address keeps the live .streaming and index.jsonl feed but\n\
-         writes .c/.h/.asm/README at the end, byte-identical to the export without\n\
-         --stream (so reproducible under --jobs N), and index.jsonl in address order.\n\
+         --progress keeps the live .streaming and index.jsonl feed but writes\n\
+         .c/.h/.asm/README at the end, byte-identical to the export without it (so\n\
+         reproducible under --jobs N), and index.jsonl in address order.\n\
          Individual function failures are recorded in the artifacts. A mixed run\n\
          exits 0; a selected set that produced no body exits 1 only after all\n\
          artifacts are complete. A rejected --assert exits 1 the same way under\n\
@@ -226,7 +213,7 @@ fn usage() {
     );
 }
 
-/// What a streamed export with the address layout observes of [`decompile_project`]:
+/// What a `--progress` export observes of [`decompile_project`]:
 /// the same export, reported on while it runs.
 pub(crate) trait ExportWatch: PoolWatch {
     /// Load the program; the watcher keeps its own clock running meanwhile.

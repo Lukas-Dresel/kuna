@@ -1,4 +1,4 @@
-//! `--stream --stream-layout address`: the non-stream export, reported on.
+//! `decompile-project --progress`: the non-stream export, reported on.
 //!
 //! [`decompile_project`] runs unchanged — the same serial or pooled decompile,
 //! the same merge and structure naming, the same four artifacts written at the
@@ -33,7 +33,7 @@ pub(super) fn export(
     layout: &Layout,
     run: &StreamRun,
 ) -> Result<ProjectCompletion, String> {
-    let watch = AddressWatch { run, layout, readme_gate: Mutex::new(()), feed: Mutex::new(Feed::default()) };
+    let watch = ProgressWatch { run, layout, readme_gate: Mutex::new(()), feed: Mutex::new(Feed::default()) };
     let completion = watch.with_clock(|| decompile_project(args, output, Some(&watch)))?;
     let status = run.dir.join(STATUS_FILE);
     std::fs::remove_file(&status).map_err(|e| format!("cannot remove {}: {e}", status.display()))?;
@@ -47,7 +47,7 @@ struct Feed {
     seq: usize,
 }
 
-struct AddressWatch<'a> {
+struct ProgressWatch<'a> {
     run: &'a StreamRun,
     layout: &'a Layout,
     /// Held across a running-README publish and across the move to
@@ -56,7 +56,7 @@ struct AddressWatch<'a> {
     feed: Mutex<Feed>,
 }
 
-impl AddressWatch<'_> {
+impl ProgressWatch<'_> {
     /// Run `body` while `.streaming` ticks, and the README with it until the
     /// export starts finalizing.  The clock is stopped and joined before this
     /// returns, so nothing rewrites `.streaming` after the caller removes it.
@@ -101,7 +101,7 @@ impl AddressWatch<'_> {
     }
 
     /// Clear the previous export's artifacts and open the feed: from here the
-    /// folder is this run's, as it is once a decompile-layout run truncates.
+    /// folder is this run's, as it is once a `--stream` run truncates.
     fn open_feed(&self) -> Result<(), String> {
         let name = &self.layout.file_name;
         self.run.artifacts.store(true, Ordering::SeqCst);
@@ -148,7 +148,7 @@ impl AddressWatch<'_> {
     }
 }
 
-impl PoolWatch for AddressWatch<'_> {
+impl PoolWatch for ProgressWatch<'_> {
     fn workers(&self, n: usize) {
         self.run.workers.store(n, Ordering::SeqCst);
     }
@@ -172,7 +172,7 @@ impl PoolWatch for AddressWatch<'_> {
     }
 }
 
-impl ExportWatch for AddressWatch<'_> {
+impl ExportWatch for ProgressWatch<'_> {
     fn load(&self, args: &Args) -> Result<ConsoleProgram, String> {
         load_program(args, DriverDefaults::Decompile)
     }

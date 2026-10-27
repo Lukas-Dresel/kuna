@@ -1065,9 +1065,33 @@ fn streamed_artifacts_match_the_non_stream_export() {
     }
 }
 
-/// The `index.jsonl` lines of an address-layout export, checked against its
+/// Run a `--progress` export into a fresh temp directory.
+fn progress_project(fixture_name: &str, tag: &str, extra: &[&str]) -> PathBuf {
+    let bin = fixture(fixture_name);
+    let dir = out_dir(tag);
+    let specs = specs();
+    let mut args: Vec<&str> = vec![
+        "decompile-project",
+        &bin,
+        "-o",
+        dir.to_str().unwrap(),
+        "--progress",
+        "--max-fn-seconds",
+        "0",
+        "--sleighpath",
+        &specs,
+    ];
+    args.extend_from_slice(extra);
+    let (_stdout, stderr, ok) = run_kuna(&args);
+    if !ok {
+        panic!("--progress project export failed on {fixture_name}: {stderr}");
+    }
+    dir
+}
+
+/// The final `index.jsonl` of a `--progress` export, checked against its
 /// `.c`: contiguous `seq`, ascending addresses, and offsets that slice each block.
-fn assert_address_index(dir: &std::path::Path, file_name: &str) -> String {
+fn assert_final_index(dir: &std::path::Path, file_name: &str) -> String {
     let c = std::fs::read_to_string(dir.join(format!("{file_name}.c"))).unwrap();
     let index = std::fs::read_to_string(dir.join("index.jsonl")).unwrap();
     let mut end = format!("#include \"{file_name}.h\"\n\n").len();
@@ -1089,13 +1113,13 @@ fn assert_address_index(dir: &std::path::Path, file_name: &str) -> String {
     index
 }
 
-/// `--stream-layout address` is the non-stream export plus `index.jsonl`: the
-/// four artifacts are byte-identical to it, and so is the whole folder from one
-/// job count to the next.
+/// `--progress` is the non-stream export plus `index.jsonl`: the four artifacts
+/// are byte-identical to it, and so is the whole folder from one job count to
+/// the next.
 #[test]
-fn an_address_layout_stream_is_the_non_stream_export_plus_its_index() {
+fn a_progress_export_is_the_non_stream_export_plus_its_index() {
     let name = "dwarfstructs_x86_64";
-    let plain = out_dir("address_plain");
+    let plain = out_dir("progress_plain");
     let (_, stderr, ok) = run_kuna(&[
         "decompile-project",
         &fixture(name),
@@ -1113,11 +1137,10 @@ fn an_address_layout_stream_is_the_non_stream_export_plus_its_index() {
     assert!(ok, "the reference project export failed: {stderr}");
     assert!(!plain.join("index.jsonl").exists());
 
-    let address = ["--stream-layout", "address"];
     let runs = [
-        stream_project(name, "address_j3", &[&address[..], &["--jobs", "3", "--jobs-chunk", "1"]].concat()),
-        stream_project(name, "address_j2", &[&address[..], &["--jobs", "2"]].concat()),
-        stream_project(name, "address_j1", &[&address[..], &["--option", "protoorder", "off"]].concat()),
+        progress_project(name, "progress_j3", &["--jobs", "3", "--jobs-chunk", "1"]),
+        progress_project(name, "progress_j2", &["--jobs", "2"]),
+        progress_project(name, "progress_j1", &["--option", "protoorder", "off"]),
     ];
     let mut indexes = Vec::new();
     for dir in &runs {
@@ -1130,7 +1153,7 @@ fn an_address_layout_stream_is_the_non_stream_export_plus_its_index() {
                 dir.display()
             );
         }
-        indexes.push(assert_address_index(dir, name));
+        indexes.push(assert_final_index(dir, name));
     }
     assert!(indexes.windows(2).all(|w| w[0] == w[1]), "index.jsonl depends on the job count");
     for dir in runs.iter().chain([&plain]) {
@@ -1138,16 +1161,16 @@ fn an_address_layout_stream_is_the_non_stream_export_plus_its_index() {
     }
 }
 
-/// While an address-layout export runs, `.streaming` counts, `index.jsonl`
+/// While a `--progress` export runs, `.streaming` counts, `index.jsonl`
 /// grows one feed line per finished function with no `.c` span yet, and the
 /// previous export's `.c` is gone rather than passing for this run's.  A stalled
 /// worker holds the run open long enough to look: the smallest function is the
 /// last chunk of the plan, so the worker that draws it is already warm and the
 /// watchdog kills it after four one-second budgets.
 #[test]
-fn an_address_layout_stream_reports_progress_before_it_writes_the_export() {
+fn a_progress_export_reports_progress_before_it_writes_the_export() {
     let name = "dwarfstructs_x86_64";
-    let dir = stream_project(name, "address_live", &["--stream-layout", "address"]);
+    let dir = progress_project(name, "progress_live", &[]);
     let index = std::fs::read_to_string(dir.join("index.jsonl")).unwrap();
     let total = index.lines().count();
     let smallest = index
@@ -1162,9 +1185,7 @@ fn an_address_layout_stream_reports_progress_before_it_writes_the_export() {
             &fixture(name),
             "-o",
             dir.to_str().unwrap(),
-            "--stream",
-            "--stream-layout",
-            "address",
+            "--progress",
             "--jobs",
             "2",
             "--jobs-chunk",
@@ -1214,7 +1235,7 @@ fn an_address_layout_stream_reports_progress_before_it_writes_the_export() {
     }
 
     assert!(!dir.join(".streaming").exists());
-    let index = assert_address_index(&dir, name);
+    let index = assert_final_index(&dir, name);
     assert_eq!(index.lines().count(), total);
     let stalled = index
         .lines()
@@ -1224,19 +1245,14 @@ fn an_address_layout_stream_reports_progress_before_it_writes_the_export() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `--stream-layout` names a streamed export's layout, so it is refused alone
-/// and with a value it does not know, before any folder is created.
+/// `--stream` already reports progress, so with both flags the export is the
+/// streamed one: decompile-ordered, with the streamed README.
 #[test]
-fn stream_layout_is_refused_without_stream_or_a_known_value() {
-    let dir = out_dir("address_refused");
-    for extra in [&["--stream-layout", "address"][..], &["--stream", "--stream-layout", "sorted"][..]] {
-        let mut args = vec!["decompile-project", "/bin/true", "-o", dir.to_str().unwrap()];
-        args.extend_from_slice(extra);
-        let out = Command::new(env!("CARGO_BIN_EXE_kuna")).args(&args).output().unwrap();
-        assert_eq!(out.status.code(), Some(2), "{extra:?}");
-        assert!(String::from_utf8_lossy(&out.stderr).contains("--stream-layout"), "{extra:?}");
-        assert!(!dir.exists(), "a refused run created {}", dir.display());
-    }
+fn stream_wins_over_progress() {
+    let dir = stream_project("dwarfstructs_x86_64", "stream_and_progress", &["--progress"]);
+    let readme = std::fs::read_to_string(dir.join("README.md")).unwrap();
+    assert!(readme.contains("Generated by `kuna decompile-project --stream`."), "{readme}");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Streamed project selection reads the same discovered inventory as
